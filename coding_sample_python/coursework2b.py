@@ -14,18 +14,14 @@ from scipy.optimize import leastsq
 import urllib.request
 import pandas as pd
 
-
-# Step 1: Download from GitHub
+# --- Import data --- 
 url = "https://raw.githubusercontent.com/Itsyimi2002/uni/main/coding_samples/amrdata.txt"
 response = urllib.request.urlopen(url)
 
-# Step 2: Load using pandas
 df = pd.read_csv(response, delim_whitespace=True, header=None)
 
-# Step 3: Convert to numpy array
 amrdata = df.values
 
-# Step 4: Split columns
 time = amrdata[:, 0]
 resistant_ratio = amrdata[:, 1]
 
