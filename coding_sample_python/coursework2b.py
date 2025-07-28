@@ -20,7 +20,7 @@ url = "https://raw.githubusercontent.com/Itsyimi2002/uni/main/coding_samples/amr
 response = urllib.request.urlopen(url)
 
 # Step 2: Load using pandas
-df = pd.read_csv(response, delim_whitespace=True, header=None)  # 如果是以空格/Tab 分隔的就用这个
+df = pd.read_csv(response, delim_whitespace=True, header=None)
 
 # Step 3: Convert to numpy array
 amrdata = df.values
