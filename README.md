@@ -1,1 +1,1 @@
-# some coding examples from coursework in the undergrad and master program 
+**# some coding examples from coursework in my undergrad and master program 
