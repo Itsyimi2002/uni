@@ -1,0 +1,1533 @@
+---
+title: "austin_hw5"
+author: "1ms"
+date: "2025-05-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=FALSE, warning=FALSE, results = "hide"}
+library(tidyverse)
+library(sf)
+library(raster)
+library(kableExtra)
+library(tidycensus)
+library(tigris)
+library(FNN)
+library(caret)
+library(yardstick)
+library(plotROC) 
+library(ggrepel)
+library(pROC)
+library(grid)
+library(gridExtra)
+library(viridis)
+library(igraph)
+library(mapview)
+library(FedData)
+library(terra)
+library(classInt)       # For classification
+library(mapview)        # For interactive maps
+library(ggplot2)
+library(knitr)
+library(ROCR)
+library(mapedit)  
+palette2 <- c("#41b6c4","#253494")
+palette4 <- c("#a1dab4","#41b6c4","#2c7fb8","#253494")
+palette5 <- c("#ffffcc","#a1dab4","#41b6c4","#2c7fb8","#253494")
+palette10 <- c("#f7fcf0","#e0f3db","#ccebc5","#a8ddb5","#7bccc4",
+               "#4eb3d3","#2b8cbe","#0868ac","#084081","#f7fcf0")
+```
+
+```{r custom functions}
+# Custom helper functions used in urban growth modeling
+quintileBreaks <- function(df,variable) {
+    as.character(quantile(df[[variable]],
+                          c(.01,.2,.4,.6,.8),na.rm=T))
+}
+
+xyC <- function(aPolygonSF) {
+  as.data.frame(
+    cbind(x=st_coordinates(st_centroid(aPolygonSF))[,1],
+          y=st_coordinates(st_centroid(aPolygonSF))[,2]))
+} 
+
+rast <- function(inRaster) {
+  data.frame(
+    xyFromCell(inRaster, 1:ncell(inRaster)), 
+    value = getValues(inRaster)) }
+
+nn_function <- function(measureFrom,measureTo,k) {
+  measureFrom_Matrix <- as.matrix(measureFrom)
+  measureTo_Matrix <- as.matrix(measureTo)
+  nn <- get.knnx(measureTo, measureFrom, k)$nn.dist
+  output <- as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint) %>%
+    pull()
+  return(output)  
+}
+
+aggregateRaster <- function(inputRasterList, theFishnet) {
+  theseFishnets <- theFishnet %>% dplyr::select()
+  for (i in inputRasterList) {
+    varName <- names(i)
+    thesePoints <-
+      rasterToPoints(i) %>%
+      as.data.frame() %>%
+      st_as_sf(coords = c("x", "y"), crs = st_crs(theFishnet)) %>%
+      filter(.[[1]] == 1)
+    thisFishnet <-
+      aggregate(thesePoints, theFishnet, length) %>%
+      mutate(!!varName := ifelse(is.na(.[[1]]),0,1))
+    theseFishnets <- cbind(theseFishnets,thisFishnet)
+  }
+  return(theseFishnets)
+}
+```
+
+```{r import data}
+#import land cover data in 2011 and 2021
+lc_2011 <- terra::rast("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/data/land cover/2011.tif")
+lc_2021 <- terra::rast("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/data/land cover/2021.tif")
+
+# import road data in 2011 and 2021
+roads_2011 <- vect("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/tl_2011_48_pri_FeaturesToJSO.json")
+roads_2021 <- vect("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/tl_2021_48_pri_FeaturesToJSO.json")
+
+# MSA boundary  
+msa_boundary <- vect("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/bastrop_county_FeaturesToJSO.json")  
+msa_boundary <- project(msa_boundary, crs(lc_2011))
+roads_2011 <- project(roads_2011, crs(lc_2011))
+roads_2021 <- project(roads_2021, crs(lc_2011))
+
+# Clip raster and vectors to Austin MSA boundary
+lc_2011_austin <- mask(crop(lc_2011, msa_boundary), msa_boundary)
+lc_2021_austin <- mask(crop(lc_2021, msa_boundary), msa_boundary)
+roads_2011_austin <- crop(roads_2011, msa_boundary)
+roads_2021_austin <- crop(roads_2021, msa_boundary)
+```
+
+```{r land cover change and data exploration}
+austinMSA <- msa_boundary %>% sf::st_as_sf()
+austinMSA <- st_transform(austinMSA, 2278)  # NAD83 / Texas Central (ftUS)
+# Convert terra SpatRaster to raster format (if needed for compatibility)
+lc_2011_r <- raster::raster(lc_2011_austin)
+lc_2021_r <- raster::raster(lc_2021_austin)
+
+# Resample to 30x coarser resolution using modal value (for categorical data)
+lc_2011_rs <- aggregate(lc_2011_r, fact = 30, fun = "modal")
+lc_2021_rs <- aggregate(lc_2021_r, fact = 30, fun = "modal")
+
+# Reclassify to Developed (1) vs. Undeveloped (0)
+# Define reclassification: Developed classes = 13 to 24
+reclassMatrix <- matrix(c(
+  0, 12, 0,
+  12, 24, 1,
+  24, Inf, 0),
+  ncol = 3, byrow = TRUE
+)
+
+# Reclassify each land cover raster
+developed_2011 <- reclassify(lc_2011_rs, reclassMatrix)
+developed_2021 <- reclassify(lc_2021_rs, reclassMatrix)
+
+# Detect Development Change
+# Add rasters together: 0 = undeveloped both, 1 = changed, 2 = developed both
+development_change <- developed_2011 + developed_2021
+
+# Histogram to inspect values
+hist(development_change, main = "Land Cover Change (2011–2021)",
+     xlab = "0: No Dev | 1: Change | 2: Dev Both", col = "lightblue")
+
+# Isolate Only Changed Cells (value = 1)
+# Set values that are NOT 1 (i.e., no change or dev both) to NA
+development_change[development_change != 1] <- NA
+
+# Visualize Land Cover Change
+mapView(development_change, layer.name = "Development Change (2011–2021)")
+```
+
+```{r}
+# Reclassify development_change raster to a clear value (e.g., 1 for New Development)
+library(terra)
+library(mapview)
+
+# Step 1: Recode raster to 1 for new development (already done)
+development_change_clean <- development_change
+development_change_clean[!is.na(development_change_clean)] <- 1
+
+# Step 2: Convert to factor for legend clarity
+development_change_clean <- as.factor(development_change_clean)
+levels(development_change_clean) <- data.frame(ID = 1, category = "New Development")
+
+# Step 3: Define custom color palette
+dev_palette <- c("New Development" = "deeppink")
+
+# Step 4: Visualize with clear legend
+mapView(
+  development_change_clean,
+  col.regions = dev_palette,
+  layer.name = "Development Change (2011–2021)",
+  legend = TRUE
+)
+
+
+```
+
+```{r create fishnet}
+# Create fishnet grid over the Austin MSA at same resolution & CRS as development raster
+# Convert msa_boundary to sf format
+msa_boundary_sf <- sf::st_as_sf(msa_boundary)
+
+# Then create the fishnet
+austin_fishnet <- 
+  st_make_grid(msa_boundary_sf %>%
+                 st_transform(crs(development_change)),
+               cellsize = res(development_change)[1],
+               square = TRUE) %>%
+  st_sf() %>%
+  st_intersection(
+    msa_boundary_sf %>%
+      dplyr::select(geometry) %>%
+      st_transform(crs(development_change))
+  ) %>%
+  mutate(uniqueID = rownames(.))
+```
+
+```{r}
+# Reclassify NLCD codes into new land cover categories
+
+developed_2011 <- lc_2011_rs %in% c(21, 22, 23, 24)
+forest_2011 <- lc_2011_rs %in% c(41, 42, 43)
+farm_2011 <- lc_2011_rs %in% c(81, 82)
+wetlands_2011 <- lc_2011_rs %in% c(90, 95)
+otherUndeveloped_2011 <- lc_2011_rs %in% c(52, 71, 31)
+water_2011 <- lc_2011_rs == 11
+
+developed_2021 <- lc_2021_rs %in% c(21, 22, 23, 24)
+forest_2021 <- lc_2021_rs %in% c(41, 42, 43)
+farm_2021 <- lc_2021_rs %in% c(81, 82)
+wetlands_2021 <- lc_2021_rs %in% c(90, 95)
+otherUndeveloped_2021 <- lc_2021_rs %in% c(52, 71, 31)
+water_2021 <- lc_2021_rs == 11
+
+# Assign names for aggregation
+names(developed_2011) <- "developed_2011"
+names(forest_2011) <- "forest_2011"
+names(farm_2011) <- "farm_2011"
+names(wetlands_2011) <- "wetlands_2011"
+names(otherUndeveloped_2011) <- "otherUndeveloped_2011"
+names(water_2011) <- "water_2011"
+
+names(developed_2021) <- "developed_2021"
+names(forest_2021) <- "forest_2021"
+names(farm_2021) <- "farm_2021"
+names(wetlands_2021) <- "wetlands_2021"
+names(otherUndeveloped_2021) <- "otherUndeveloped_2021"
+names(water_2021) <- "water_2021"
+
+# Create raster lists
+rasterList_2011 <- c(developed_2011, forest_2011, farm_2011,
+                     wetlands_2011, otherUndeveloped_2011, water_2011)
+
+rasterList_2021 <- c(developed_2021, forest_2021, farm_2021,
+                     wetlands_2021, otherUndeveloped_2021, water_2021)
+
+# Aggregate 2011 land cover categories to fishnet
+lcRasters_2011 <- aggregateRaster(rasterList_2011, austin_fishnet) %>%
+  dplyr::select(developed_2011,
+                forest_2011,
+                farm_2011,
+                wetlands_2011,
+                otherUndeveloped_2011,
+                water_2011) %>%
+  mutate_if(is.numeric, as.factor)
+
+# Aggregate 2021 land cover categories to fishnet (if needed for visual/validation)
+lcRasters_2021 <- aggregateRaster(rasterList_2021, austin_fishnet) %>%
+  dplyr::select(developed_2021,
+                forest_2021,
+                farm_2021,
+                wetlands_2021,
+                otherUndeveloped_2021,
+                water_2021) %>%
+  mutate_if(is.numeric, as.factor)
+
+# Convert raster to points, then join to fishnet
+changePoints <- rasterToPoints(development_change) %>%
+  as.data.frame() %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(austin_fishnet))
+
+# Summarize change points to each fishnet cell
+fishnet <- aggregate(changePoints, austin_fishnet, FUN = sum) %>%
+  mutate(development_change = ifelse(is.na(layer), 0, 1),
+         development_change = as.factor(development_change)) %>%
+  dplyr::select(-layer)
+
+```
+
+```{r}
+# First, create a new base fishnet with uniqueID (if you haven't)
+fishnet <- austin_fishnet %>%
+  mutate(uniqueID = as.character(rownames(.)))
+
+# Then, make sure lcRasters_2011 has the same uniqueID column in the same order
+lcRasters_2011 <- lcRasters_2011 %>%
+  mutate(uniqueID = as.character(rownames(.)))
+
+# Now you can safely join
+fishnet <- left_join(fishnet, st_drop_geometry(lcRasters_2011), by = "uniqueID")
+```
+
+```{r}
+# Plot land cover types in 2011 to verify aggregation
+lcRasters_2011 %>%
+  st_centroid() %>%
+  gather(key = "variable", value = "value", developed_2011:water_2011) %>% 
+  mutate(X = xyC(.)$x, Y = xyC(.)$y) %>%
+  ggplot() +
+    geom_sf(data = austinMSA) +
+    geom_point(aes(X, Y, colour = as.factor(value))) +
+    facet_wrap(~variable) +
+    scale_colour_manual(values = palette2,
+                        labels = c("Other", "Land Cover"),
+                        name = "") +
+    labs(title = "Land Cover Types, 2011 (Austin Fishnet)",
+         subtitle = "As fishnet centroids") +
+    theme_void()
+```
+
+### This 6-panel map displays the spatial distribution of major land cover types within the Austin metropolitan statistical area as of 2011, mapped to a fishnet grid structure. Categories include developed land, farmland, forest, other undeveloped areas, wetlands, and water. These maps provide a baseline understanding of landscape composition and land availability prior to urban expansion, supporting analysis of conversion patterns and suitability for future development.
+
+# section 6
+
+```{r}
+# Tract Boundaries
+tracts_2011 <- st_read("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/2011_census_tract.json")
+tracts_2021 <- st_read("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/2021_census_tract.json")
+```
+
+```{r}
+# Define FIPS codes for your counties
+austin_fips <- c("48453", "48491", "48209", "48021", "48055")
+
+# Filter tract shapefiles to only Austin MSA counties
+tracts_2011 <- tracts_2011 %>% filter(substr(GEOID, 1, 5) %in% austin_fips)
+tracts_2021 <- tracts_2021 %>% filter(substr(GEOID, 1, 5) %in% austin_fips)
+
+library(dplyr)
+library(readr)
+library(stringr)
+
+# Define the directory and file patterns
+pop_dir <- "/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/pop"
+
+# Define the county names and years
+counties <- c("travis", "williamson", "hays", "bastrop", "caldwell")
+years <- c("2011", "2021")
+
+read_clean_pop <- function(county, year) {
+  file_path <- file.path(pop_dir, paste0(county, "_", year, ".csv"))
+  
+  read_csv(file_path, skip = 1, show_col_types = FALSE) %>%
+    filter(str_starts(Geography, "1400000US")) %>%  # ✅ filter real tract rows
+    transmute(
+      NAME = `Geographic Area Name`,
+      GEOID_raw = Geography,
+      pop = as.numeric(`Estimate!!Total`),
+      GEOID = str_extract(Geography, "\\d{11}$"),  # Only final 11 digits
+      county = str_to_title(county),
+      year = year
+    )
+}
+
+# Read and bind data for each year
+pop2011_all <- bind_rows(lapply(counties, read_clean_pop, year = "2011"))
+pop2021_all <- bind_rows(lapply(counties, read_clean_pop, year = "2021"))
+
+tracts_2011 <- left_join(tracts_2011, pop2011_all, by = "GEOID")
+tracts_2021 <- left_join(tracts_2021, pop2021_all, by = "GEOID")
+```
+
+```{r plot population}
+# Custom palette
+palette5 <- c("#ffffcc", "#a1dab4", "#41b6c4", "#2c7fb8", "#253494")
+
+# Plot for 2011
+p2011 <- ggplot() +
+  geom_sf(data = tracts_2011, aes(fill = factor(ntile(pop, 5))), color = NA) +
+  scale_fill_manual(values = palette5,
+                    labels = quantile(tracts_2011$pop, probs = seq(0, 1, 0.2), na.rm = TRUE),
+                    name = "Quintile\nBreaks") +
+  labs(title = "Population, Austin MSA: 2011") +
+  theme_void()
+
+# Plot for 2021
+p2021 <- ggplot() +
+  geom_sf(data = tracts_2021, aes(fill = factor(ntile(pop, 5))), color = NA) +
+  scale_fill_manual(values = palette5,
+                    labels = quantile(tracts_2021$pop, probs = seq(0, 1, 0.2), na.rm = TRUE),
+                    name = "Quintile\nBreaks") +
+  labs(title = "Population, Austin MSA: 2021") +
+  theme_void()
+
+# Display side by side
+gridExtra::grid.arrange(p2011, p2021, ncol = 2)
+
+```
+
+### This figure compares population distribution across the Austin metropolitan area in 2011 and 2021, classified by quintiles. Darker shades represent census tracts with higher population counts. The maps visually capture demographic shifts over the decade, particularly increased density in central Austin and surrounding high-growth zones. These patterns are critical for understanding development pressure and guiding infrastructure planning.
+
+```{r}
+# Make sure tracts are in the same CRS as the fishnet
+tracts_2011 <- st_transform(tracts_2011, st_crs(austin_fishnet))
+tracts_2021 <- st_transform(tracts_2021, st_crs(austin_fishnet))
+
+# Interpolate tract population data to fishnet grid for 2011
+fishnetPopulation2011 <- 
+  st_interpolate_aw(tracts_2011["pop"], austin_fishnet, extensive = TRUE) %>%
+  st_centroid() %>%
+  st_join(austin_fishnet, ., join = st_intersects) %>%
+  mutate(pop_2011 = replace_na(pop, 0)) %>%
+  dplyr::select(pop_2011)
+
+# Interpolate tract population data to fishnet grid for 2021
+fishnetPopulation2021 <- 
+  st_interpolate_aw(tracts_2021["pop"], austin_fishnet, extensive = TRUE) %>%
+  st_centroid() %>%
+  st_join(austin_fishnet, ., join = st_intersects) %>%
+  mutate(pop_2021 = replace_na(pop, 0)) %>%
+  dplyr::select(pop_2021)
+
+```
+
+```{r}
+library(gridExtra)
+
+# Plot: 2011 Tract Population
+pop_plot_tract_2011 <- ggplot() +
+  geom_sf(data = tracts_2011, aes(fill = factor(ntile(pop, 5))), color = NA) +
+  scale_fill_manual(
+    values = palette5,
+    labels = substr(quintileBreaks(tracts_2011, "pop"), 1, 4),
+    name = "Quintile\nBreaks"
+  ) +
+  labs(
+    title = "Population, Austin MSA: 2011",
+    subtitle = "Represented as census tracts"
+  ) +
+  theme_void()
+
+# Plot: 2011 Fishnet Interpolated Population
+pop_plot_fishnet_2011 <- ggplot() +
+  geom_sf(data = fishnetPopulation2011, aes(fill = factor(ntile(pop_2011, 5))), color = NA) +
+  scale_fill_manual(
+    values = palette5,
+    labels = substr(quintileBreaks(fishnetPopulation2011, "pop_2011"), 1, 4),
+    name = "Quintile\nBreaks"
+  ) +
+  labs(
+    title = "Population, Austin MSA: 2011",
+    subtitle = "Represented as interpolated fishnet grid"
+  ) +
+  theme_void()
+
+# Combine the two plots
+grid.arrange(pop_plot_tract_2011, pop_plot_fishnet_2011, ncol = 2)
+```
+
+### fugure. Population Distribution, Austin MSA (2011): Census Tracts vs. Interpolated Grid
+
+```{r}
+# Visualize 2021 Tract vs Fishnet Interpolated Population
+grid.arrange(
+  ggplot() +
+    geom_sf(data = tracts_2021, aes(fill = factor(ntile(pop, 5))), colour = NA) +
+    scale_fill_manual(values = palette5,
+                      labels = substr(quintileBreaks(tracts_2021, "pop"), 1, 4),
+                      name = "Quintile\nBreaks") +
+    labs(title = "Population, Austin MSA: 2021",
+         subtitle = "Represented as Tracts (raw)") +
+    theme_void(),
+
+  ggplot() +
+    geom_sf(data = fishnetPopulation2021, aes(fill = factor(ntile(pop_2021, 5))), colour = NA) +
+    scale_fill_manual(values = palette5,
+                      labels = substr(quintileBreaks(fishnetPopulation2021, "pop_2021"), 1, 4),
+                      name = "Quintile\nBreaks") +
+    labs(title = "Population, Austin MSA: 2021",
+         subtitle = "Interpolated to Fishnet Grid") +
+    theme_void(),
+  ncol = 2
+)
+
+```
+
+### figure. Population Distribution, Austin MSA (2021): Census Tracts vs. Interpolated Grid
+
+# section 7
+
+```{r}
+# 7.1 Define and subset highways for Austin MSA
+austinHighways <- roads_2011 %>%
+  st_as_sf() %>%
+  st_transform(st_crs(austinMSA)) %>%
+  st_intersection(st_geometry(austinMSA)) %>%
+  st_transform(st_crs(austin_fishnet))
+
+# 7.1 FIX: Make sure development_change exists in fishnet
+# Re-run this only if you lost the column previously
+# Note: development_change was calculated by summing raster points and aggregating to the grid
+
+# Re-aggregate dev change from raster to fishnet (just to be sure)
+changePoints <- rasterToPoints(development_change) %>%
+  as.data.frame() %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(austin_fishnet))
+
+fishnet <- aggregate(changePoints, austin_fishnet, FUN = sum) %>%
+  mutate(development_change = ifelse(is.na(layer), 0, 1),
+         development_change = factor(development_change, levels = c(0,1), labels = c("No Change", "New Development"))) %>%
+  dplyr::select(-layer)
+
+# 7.2 Visualize development change and highways using geometry-aware `geom_sf()`
+ggplot() +
+  geom_sf(data = fishnet, aes(fill = development_change), color = NA) +
+  geom_sf(data = austinHighways, color = "black", size = 0.4) +
+  scale_fill_manual(values = palette2) +
+  labs(title = "New Development and Highways (2011–2021)",
+       subtitle = "Austin Fishnet Cells with Primary Roads") +
+  theme_void()
+
+```
+
+### the spatial relationship between primary highways and new development across the Austin Metropolitan Statistical Area (MSA). Using a fishnet grid, areas marked in dark blue represent new development from 2011 to 2021, overlaid with primary road networks. The visualization highlights how development tends to cluster around major transportation corridors, supporting the inclusion of road proximity as a key predictor in the urban growth model.
+
+```{r}
+library(sf)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+
+# Ensure geometries have same CRS
+roads_2011_sf <- st_transform(st_as_sf(roads_2011_austin), st_crs(austin_fishnet))
+roads_2021_sf <- st_transform(st_as_sf(roads_2021_austin), st_crs(austin_fishnet))
+msa_sf <- st_transform(st_as_sf(msa_boundary), st_crs(austin_fishnet))
+
+
+# Generate centroids from fishnet
+fishnet_centroids <- st_centroid(austin_fishnet)
+
+# Calculate distances to roads
+fishnet_centroids$dist_highway_2011 <- as.numeric(
+  st_distance(fishnet_centroids, st_union(roads_2011_sf))
+)
+fishnet_centroids$dist_highway_2021 <- as.numeric(
+  st_distance(fishnet_centroids, st_union(roads_2021_sf))
+)
+
+# Plot 2011 distance
+plot_2011 <- ggplot() +
+  geom_sf(data = msa_sf) +
+  geom_point(data = fishnet_centroids,
+             aes(x = st_coordinates(fishnet_centroids)[,1],
+                 y = st_coordinates(fishnet_centroids)[,2],
+                 colour = factor(ntile(dist_highway_2011, 5))),
+             size = 1.2) +
+  geom_sf(data = roads_2011_sf, color = "red") +
+  scale_colour_manual(values = palette5,
+                      labels = substr(quintileBreaks(fishnet_centroids, "dist_highway_2011"), 1, 8),
+                      name = "2011 Distance\nQuintiles") +
+  labs(title = "Distance to Highways (2011)",
+       subtitle = "Red = 2011 Highways") +
+  theme_void()
+
+# Plot 2021 distance
+plot_2021 <- ggplot() +
+  geom_sf(data = msa_sf) +
+  geom_point(data = fishnet_centroids,
+             aes(x = st_coordinates(fishnet_centroids)[,1],
+                 y = st_coordinates(fishnet_centroids)[,2],
+                 colour = factor(ntile(dist_highway_2021, 5))),
+             size = 1.2) +
+  geom_sf(data = roads_2021_sf, color = "black") +
+  scale_colour_manual(values = palette5,
+                      labels = substr(quintileBreaks(fishnet_centroids, "dist_highway_2021"), 1, 8),
+                      name = "2021 Distance\nQuintiles") +
+  labs(title = "Distance to Highways (2021)",
+       subtitle = "Black = 2021 Highways") +
+  theme_void()
+
+# Combine plots
+grid.arrange(plot_2011, plot_2021, ncol = 2)
+
+```
+
+### Euclidean distance from each fishnet centroid to the nearest primary highway within the Austin Metropolitan Statistical Area. Red lines represent major highways, while the color gradient shows increasing distance from these roads
+
+# new proposed highway as predictor
+
+```{r}
+# 1. Load your new highway file as sf
+new_highway <- st_read("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/proposed_1highway.geojson")
+
+# 2. Ensure it matches CRS of fishnet
+new_highway <- st_transform(new_highway, st_crs(austin_fishnet))
+
+# 3. Calculate distance from centroids to the highway
+fishnet_centroids <- st_centroid(austin_fishnet)
+
+fishnet_centroids$distance_new_highway <- as.numeric(
+  st_distance(fishnet_centroids, st_union(new_highway))
+)
+
+```
+
+#section 8
+
+```{r}
+# Objective:
+# The code calculates the spatial lag to the nearest two developed cells in 2011 and 2021 from the centroids of a fishnet grid, and then visualizes the 2011 lag in a choropleth-style plot using quintile classification.
+
+# Calculate spatial lag to 2 nearest developed cells in 2011
+fishnet$lagDevelopment_2011 <-
+  nn_function(
+    fishnet %>%
+      st_centroid() %>%
+      st_coordinates() %>%
+      as.data.frame(),
+    lcRasters_2011 %>%
+      filter(developed_2011 == 1) %>%
+      st_centroid() %>%
+      st_coordinates() %>%
+      as.data.frame(),
+    k = 2
+  )
+
+# Duplicate for 2021 using the same assumption (or adapt if new dev data used)
+fishnet$lagDevelopment_2021 <-
+  nn_function(
+    fishnet %>%
+      st_centroid() %>%
+      st_coordinates() %>%
+      as.data.frame(),
+    lcRasters_2021 %>%
+      filter(developed_2021 == 1) %>%
+      st_centroid() %>%
+      st_coordinates() %>%
+      as.data.frame(),
+    k = 2
+  )
+ggplot() +
+  geom_sf(data = austinMSA %>% st_transform(st_crs(fishnet))) +
+  geom_point(data = fishnet,
+             aes(x = xyC(fishnet)[,1],
+                 y = xyC(fishnet)[,2],
+                 colour = factor(ntile(lagDevelopment_2011, 5))),
+             size = 1.5) +
+  scale_colour_manual(values = palette5,
+                      labels = substr(quintileBreaks(fishnet, "lagDevelopment_2011"), 1, 7),
+                      name = "Quintile\nBreaks") +
+  labs(title = "Spatial Lag to 2011 Development (ft)",
+       subtitle = "Measured from fishnet centroids to nearest developed cells") +
+  theme_void()
+
+
+```
+
+### the spatial lag to prior urban development in the Austin MSA by showing the average distance (in feet) from each fishnet centroid to its two nearest developed cells in 2011. Quintile classification reveals spatial patterns in proximity, highlighting areas with strong development momentum (lighter colors) versus more isolated or undeveloped regions (darker shades). This metric is critical in understanding contagion effects and diffusion-based urban growth.
+
+# section 9
+
+```{r}
+# Define the directory containing your county geojson files
+county_dir <- "/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/county"
+
+# Define the county file name roots (all lowercase to match filenames)
+county_names <- c("bastrop", "caldwell", "hays", "travis", "williamson")
+
+# Function to read and tag each county
+read_county <- function(county) {
+  file_path <- file.path(county_dir, paste0(tools::toTitleCase(county), "_County.geojson"))
+  st_read(file_path, quiet = TRUE) %>%
+    mutate(NAME = tools::toTitleCase(county))  # Add county name if not present
+}
+
+# Read and bind all counties
+studyAreaCounties <- bind_rows(lapply(county_names, read_county)) %>%
+  st_transform(st_crs(austin_fishnet))  # Match CRS
+
+countyFishnet <- austin_fishnet %>%
+  st_join(studyAreaCounties %>% dplyr::select(NAME)) %>%
+  as.data.frame() %>%
+  dplyr::select(uniqueID, NAME) %>%
+  left_join(austin_fishnet, .) %>%
+  st_as_sf() %>%
+  group_by(uniqueID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  arrange(as.numeric(uniqueID))
+```
+
+# section 10
+
+```{r}
+# Combine t1: 2011-based modeling dataset
+dat_2011 <- 
+  cbind(fishnet, highwayPoints_fishnet_2011, fishnetPopulation2011, lcRasters_2011, countyFishnet) %>%
+  as.data.frame() %>%
+  dplyr::select(uniqueID, development_change, lagDevelopment_2011, distance_highways_2011, pop_2011,  
+                developed_2011, forest_2011, farm_2011, wetlands_2011, otherUndeveloped_2011, water_2011,
+                NAME, geometry) %>%
+  filter(water_2011 == 0) %>%
+  rename_with(~ str_remove(.x, "_2011"))
+
+# Combine t2: 2021-based forecasting dataset
+dat_2021 <- 
+  cbind(fishnet, highwayPoints_fishnet_2021, fishnetPopulation2021, lcRasters_2021, countyFishnet) %>%
+  as.data.frame() %>%
+  dplyr::select(uniqueID, development_change, lagDevelopment_2021, distance_highways_2021, pop_2021,  
+                developed_2021, forest_2021, farm_2021, wetlands_2021, otherUndeveloped_2021, water_2021,
+                NAME, geometry) %>%
+  filter(water_2021 == 0)  %>%
+  rename_with(~ str_remove(.x, "_2021"))
+```
+
+```{r}
+# ---- Integrate New Highway Distance into 2031 Dataset ----
+# Assumes fishnet_newhighway has columns "uniqueID" and "distance_new_highway"
+
+# 4. Create a table with just ID and distance
+new_hw_distances <- fishnet_centroids %>%
+  st_drop_geometry() %>%
+  dplyr::select(uniqueID, distance_new_highway)
+
+# 5. Join this distance to dat_2021 by uniqueID
+dat_2021 <- dat_2021 %>%
+  left_join(new_hw_distances, by = "uniqueID")
+
+# 6. Confirm success
+summary(dat_2021$distance_new_highway)
+```
+
+# section 11
+
+```{r}
+
+dat_2011 %>%
+  dplyr::select(distance_highways, lagDevelopment, development_change, pop) %>%
+  gather(Variable, Value, -development_change) %>%
+  ggplot(aes(x = development_change, y = Value, fill = development_change)) + 
+  geom_bar(position = "dodge", stat = "summary", fun = mean) +
+  facet_wrap(~Variable, scales = "free") +
+  scale_fill_manual(values = palette2,
+                    labels = c("No Change", "New Development"),
+                    name = "Mean Value") +
+  labs(title = "New Development as a Function of Continuous Variables",
+       x = "Development Change (0 = No, 1 = Yes)",
+       y = "Mean Value") +
+  theme_minimal()
+
+```
+
+### compares the average values of three continuous predictors—distance to highways, spatial lag to existing development, and population—between areas that experienced development (1) and those that did not (0) in the Austin MSA. New development areas tend to have lower distances to highways and prior development, and higher population values, supporting the role of accessibility and density in driving urban expansion.
+
+```{r}
+# Convert land cover variables from factor to numeric (0/1)
+dat_2011 <- dat_2011 %>%
+  mutate(
+    forest = as.numeric(as.character(forest)),
+    farm = as.numeric(as.character(farm)),
+    wetlands = as.numeric(as.character(wetlands)),
+    otherUndeveloped = as.numeric(as.character(otherUndeveloped))
+  )
+dat_2011 %>%
+  dplyr::select(development_change, forest, farm, wetlands, otherUndeveloped) %>%
+  gather(key = "Land_Cover_Type", Value, -development_change) %>%
+  group_by(development_change, Land_Cover_Type) %>%
+  summarize(n = sum(Value), .groups = 'drop') %>%
+  ungroup() %>%
+  mutate(Conversion_Rate = paste0(round(100 * n / sum(n), 2), "%")) %>%
+  filter(development_change == "New Development") %>%
+  dplyr::select(Land_Cover_Type, Conversion_Rate) %>%
+  kable() %>%
+  kable_styling(full_width = FALSE)
+```
+
+### This table presents the percentage of each land cover type in 2011 that was converted to new development by 2021 in the Austin MSA. The highest conversion occurred in areas labeled “Other Undeveloped” (1.98%), followed by forested land (0.96%) and farmland (0.61%), while wetlands were least affected (0.01%), indicating effective protection or physical development constraints.
+
+# section 12
+
+```{r}
+library(caret)
+
+set.seed(3456)
+trainIndex <- createDataPartition(dat_2011$otherUndeveloped, p = 0.7, list = FALSE, times = 1)
+datTrain <- dat_2011[trainIndex, ]
+datTest <- dat_2011[-trainIndex, ]
+
+```
+
+```{r}
+Model1 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped,
+              family = binomial(link = "logit"), data = datTrain)
+
+Model2 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped + lagDevelopment,
+              family = binomial(link = "logit"), data = datTrain)
+
+Model3 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped + lagDevelopment + pop,
+              family = binomial(link = "logit"), data = datTrain)
+
+Model4 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped + lagDevelopment + pop + NAME,
+              family = binomial(link = "logit"), data = datTrain)
+
+Model5 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped + lagDevelopment + pop + distance_highways + NAME,
+              family = binomial(link = "logit"), data = datTrain)
+
+Model6 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped + pop + lagDevelopment * distance_highways + NAME,
+              family = binomial(link = "logit"), data = datTrain)
+# New logistic regression model including distance to proposed highway
+Model2031 <- glm(development_change ~ wetlands + forest + farm + otherUndeveloped +
+                   pop + lagDevelopment + distance_highways + distance_new_highway + NAME,
+                 family = binomial(link = "logit"),
+                 data = dat_2021)
+
+```
+
+```{r}
+summary(Model1)
+summary(Model2)
+summary(Model3)
+summary(Model4)
+summary(Model5)
+summary(Model6)
+summary(Model2031)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+data.frame(
+  Model = c("Model1", "Model2", "Model3", "Model4", "Model5", "Model6","Model2031"),
+  AIC = c(Model1$aic, Model2$aic, Model3$aic, Model4$aic, Model5$aic, Model6$aic, Model2031$aic)
+) %>%
+  ggplot() +
+  geom_bar(aes(x = Model, y = AIC), stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(title = "AIC Comparison of Urban Growth Models",
+       y = "Akaike Information Criterion (AIC)")
+```
+
+# Validating our Model Using the Test Set, Example on MODEL 6
+
+```{r}
+testSetProbs <- data.frame(
+  class = datTest$development_change,
+  probs = predict(Model6, datTest, type = "response")
+)
+
+ggplot(testSetProbs, aes(probs)) +
+  geom_density(aes(fill=class), alpha=0.5) +
+  scale_fill_manual(values = palette2,
+                    labels=c("No Change","New Development")) +
+  labs(title = "Histogram of Test Set Predicted Probabilities",
+       x = "Predicted Probabilities", y = "Density") +
+  theme_minimal()
+```
+
+# Confusion matrix, Example on MODEL 6
+
+```{r}
+# Fix the NA issue by reassigning directly from datTest
+# Step 1: Recode reference class directly from datTest
+testSetProbs$class <- as.numeric(datTest$development_change == "New Development")
+
+# Step 2: Create predClass based on your threshold
+testSetProbs$predClass <- ifelse(testSetProbs$probs > 0.05, 1, 0)
+
+# Step 3: Convert both to factors with same levels
+testSetProbs <- testSetProbs %>%
+  mutate(
+    class = factor(class, levels = c(0,1)),
+    predClass = factor(predClass, levels = c(0,1))
+  )
+
+# Step 4: Confusion matrix
+caret::confusionMatrix(
+  reference = testSetProbs$class,
+  data = testSetProbs$predClass,
+  positive = "1"
+)
+```
+
+# ROC Curve, Example on MODEL 6
+
+```{r}
+# Recode reference values to 1 and 0
+testSetProbs <- testSetProbs %>%
+  mutate(class = as.numeric(datTest$development_change == "New Development"))
+
+# Plot the ROC curve
+library(ggplot2)
+library(plotROC)
+
+ggplot(testSetProbs, aes(d = class, m = probs)) + 
+  geom_roc(n.cuts = 50, labels = FALSE) + 
+  style_roc(theme = theme_grey) +
+  geom_abline(slope = 1, intercept = 0, size = 1.5, color = 'grey') +
+  theme_minimal() +
+  labs(title = "ROC Curve - Austin Urban Development Model")
+
+```
+
+# Analyzing Error, Example on MODEL 6
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(sf)
+library(kableExtra)
+library(tidyr)
+library(ggplot2)
+
+# Create dat_2011_preds with predictions and classification labels
+dat_2011_preds <- dat_2011 %>%
+  mutate(
+    development_change = case_when(
+      development_change == "New Development" ~ 1,
+      development_change == "No Change" ~ 0
+    ),
+    probs = predict(Model6, ., type = "response"),
+    Threshold_5_Pct = as.numeric(probs >= 0.05),
+    Threshold_17_Pct = as.numeric(probs >= 0.17)
+  ) %>%
+  mutate(
+    confResult_05 = case_when(
+      Threshold_5_Pct == 0 & development_change == 0 ~ "True_Negative",
+      Threshold_5_Pct == 1 & development_change == 1 ~ "True_Positive",
+      Threshold_5_Pct == 0 & development_change == 1 ~ "False_Negative",
+      Threshold_5_Pct == 1 & development_change == 0 ~ "False_Positive"
+    ),
+    confResult_17 = case_when(
+      Threshold_17_Pct == 0 & development_change == 0 ~ "True_Negative",
+      Threshold_17_Pct == 1 & development_change == 1 ~ "True_Positive",
+      Threshold_17_Pct == 0 & development_change == 1 ~ "False_Negative",
+      Threshold_17_Pct == 1 & development_change == 0 ~ "False_Positive"
+    )
+  ) %>%
+  st_as_sf()
+
+# Inspect basic structure and values
+table(dat_2011_preds$Threshold_5_Pct)
+str(dat_2011_preds$Threshold_5_Pct)
+table(dat_2011$development_change)
+str(dat_2011$development_change)
+
+```
+
+```{r}
+# Confusion summary table by county and threshold
+dat_2011_preds %>%
+  as.data.frame() %>%
+  dplyr::select(NAME, confResult_05, confResult_17) %>%
+  pivot_longer(cols = starts_with("confResult"),
+               names_to = "Model_Type",
+               values_to = "Confusion_Result") %>%
+  group_by(NAME, Model_Type, Confusion_Result) %>%
+  tally() %>%
+  pivot_wider(names_from = Confusion_Result,
+              values_from = n,
+              values_fill = list(n = 0)) %>%
+  mutate(
+    TN_Rate_Specificity = 100 * (True_Negative / (True_Negative + False_Positive)),
+    TP_Rate_Sensitivity = 100 * (True_Positive / (True_Positive + False_Negative))
+  ) %>%
+  dplyr::select(NAME, Model_Type, TN_Rate_Specificity, TP_Rate_Sensitivity) %>%
+  kable() %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = dat_2011_preds %>%
+             st_centroid() %>%
+             dplyr::select(confResult_05, confResult_17, geometry) %>%
+             tidyr::pivot_longer(cols = starts_with("confResult"),
+                                 names_to = "Threshold",
+                                 values_to = "Classification") %>%
+             filter(!is.na(Classification)),
+           aes(colour = Classification)) +
+  facet_wrap(~Threshold) +
+  scale_colour_manual(
+    values = c(
+      "False_Negative" = "red",
+      "False_Positive" = "yellow",
+      "True_Negative" = "blue",
+      "True_Positive" = "gray"
+    ),
+    name = "Prediction Result"
+  ) +
+  labs(title = "Spatial Distribution of Prediction Accuracy by Threshold") +
+  theme_void()
+```
+
+```{r}
+# Prepare test set predictions for Model2031
+dat_2021_preds <- dat_2021 %>%
+  mutate(
+    development_change = case_when(
+      development_change == "New Development" ~ 1,
+      development_change == "No Change" ~ 0
+    ),
+    probs = predict(Model2031, ., type = "response"),
+    Threshold_5_Pct = as.numeric(probs >= 0.05),
+    Threshold_17_Pct = as.numeric(probs >= 0.5)
+  ) %>%
+  
+
+  mutate(
+    confResult_05 = case_when(
+      Threshold_5_Pct == 0 & development_change == 0 ~ "True_Negative",
+      Threshold_5_Pct == 1 & development_change == 1 ~ "True_Positive",
+      Threshold_5_Pct == 0 & development_change == 1 ~ "False_Negative",
+      Threshold_5_Pct == 1 & development_change == 0 ~ "False_Positive"
+    ),
+    confResult_17 = case_when(
+      Threshold_17_Pct == 0 & development_change == 0 ~ "True_Negative",
+      Threshold_17_Pct == 1 & development_change == 1 ~ "True_Positive",
+      Threshold_17_Pct == 0 & development_change == 1 ~ "False_Negative",
+      Threshold_17_Pct == 1 & development_change == 0 ~ "False_Positive"
+    )
+  ) %>%
+  st_as_sf()
+
+# Recode for confusion matrix
+testSetProbs_2031 <- dat_2021_preds %>%
+  st_drop_geometry() %>%
+  mutate(
+    class = factor(development_change, levels = c(0,1)),
+    predClass = factor(Threshold_5_Pct, levels = c(0,1))
+  )
+
+caret::confusionMatrix(
+  reference = testSetProbs_2031$class,
+  data = testSetProbs_2031$predClass,
+  positive = "1"
+)
+
+```
+
+```{r}
+# Prepare test set predictions for Model2031 using threshold 0.25
+dat_2021_preds <- dat_2021 %>%
+  mutate(
+    development_change = case_when(
+      development_change == "New Development" ~ 1,
+      development_change == "No Change" ~ 0
+    ),
+    probs = predict(Model2031, ., type = "response"),
+    Threshold_20_Pct = as.numeric(probs >= 0.2)
+  ) %>%
+  mutate(
+    confResult_20 = case_when(
+      Threshold_20_Pct == 0 & development_change == 0 ~ "True_Negative",
+      Threshold_20_Pct == 1 & development_change == 1 ~ "True_Positive",
+      Threshold_20_Pct == 0 & development_change == 1 ~ "False_Negative",
+      Threshold_20_Pct == 1 & development_change == 0 ~ "False_Positive"
+    )
+  ) %>%
+  st_as_sf()
+
+# Recode for confusion matrix (threshold = 0.25)
+testSetProbs_2031 <- dat_2021_preds %>%
+  st_drop_geometry() %>%
+  mutate(
+    class = factor(development_change, levels = c(0, 1)),
+    predClass = factor(Threshold_20_Pct, levels = c(0, 1))
+  )
+
+# Output the confusion matrix for threshold 0.25
+caret::confusionMatrix(
+  reference = testSetProbs_2031$class,
+  data = testSetProbs_2031$predClass,
+  positive = "1"
+)
+
+```
+
+```{r}
+# Make sure to load libraries
+library(ggplot2)
+library(dplyr)
+
+# Generate predictions and attach to test set
+testSetProbs_2031 <- data.frame(
+  class = dat_2021$development_change,
+  probs = predict(Model2031, dat_2021, type = "response")
+)
+
+# Plot density of predicted probabilities by true class
+ggplot(testSetProbs_2031, aes(x = probs)) +
+  geom_density(aes(fill = class), alpha = 0.5) +
+  scale_fill_manual(values = palette2,
+                    labels = c("No Change", "New Development")) +
+  labs(
+    title = "Histogram of test set predicted probabilities",
+    x = "Predicted Probabilities",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+library(plotROC)
+
+# Clean dataset before plotting ROC
+testSetProbs_2031_clean <- testSetProbs_2031 %>%
+  filter(!is.na(class), !is.na(probs))
+
+testSetProbs_2031_clean <- testSetProbs_2031_clean %>%
+  mutate(
+    d = ifelse(class == "New Development", 1,
+               ifelse(class == "No Change", 0, NA_real_))
+  ) %>%
+  filter(!is.na(d))  # just in case anything slipped through
+
+library(plotROC)
+
+ggplot(testSetProbs_2031_clean, aes(d = d, m = probs)) +
+  geom_roc(n.cuts = 50, labels = FALSE) +
+  style_roc(theme = theme_minimal()) +
+  geom_abline(slope = 1, intercept = 0, size = 1.2, color = "gray") +
+  labs(title = "ROC Curve - Model2031: Urban Development Forecast (Austin 2031)")
+
+```
+
+```{r}
+dat_2021_preds %>%
+  as.data.frame() %>%
+  dplyr::select(NAME, confResult_20) %>%
+  pivot_longer(cols = starts_with("confResult"),
+               names_to = "Model_Type",
+               values_to = "Confusion_Result") %>%
+  group_by(NAME, Model_Type, Confusion_Result) %>%
+  tally() %>%
+  pivot_wider(names_from = Confusion_Result,
+              values_from = n,
+              values_fill = list(n = 0)) %>%
+  mutate(
+    TN_Rate_Specificity = 100 * (True_Negative / (True_Negative + False_Positive)),
+    TP_Rate_Sensitivity = 100 * (True_Positive / (True_Positive + False_Negative))
+  ) %>%
+  dplyr::select(NAME, Model_Type, TN_Rate_Specificity, TP_Rate_Sensitivity) %>%
+  kable() %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = dat_2021_preds %>%
+             st_centroid() %>%
+             dplyr::select(confResult_20, geometry) %>%
+             tidyr::pivot_longer(cols = starts_with("confResult"),
+                                 names_to = "Threshold",
+                                 values_to = "Classification") %>%
+             filter(!is.na(Classification)),
+           aes(colour = Classification)) +
+  facet_wrap(~Threshold) +
+  scale_colour_manual(
+    values = c(
+      "False_Negative" = "red",
+      "False_Positive" = "yellow",
+      "True_Negative" = "blue",
+      "True_Positive" = "gray"
+    ),
+    name = "Prediction Result"
+  ) +
+  labs(title = "Model2031: Spatial Distribution of Prediction Accuracy") +
+  theme_void()
+
+```
+
+# section 13
+
+```{r}
+ggplot(data = dat_2031_preds) +
+  geom_point(aes(x = xyC(dat_2031_preds)[, 1],
+                 y = xyC(dat_2031_preds)[, 2],
+                 colour = Prediction)) +
+  geom_sf(data = studyAreaCounties, fill = "transparent", color = "black") +
+  scale_colour_manual(
+    values = c("0" = "#fcbba1", "1" = "#2b8cbe"),
+    labels = c("0" = "No Development", "1" = "New Development"),
+    name = "2031 Development Prediction"
+  ) +
+  labs(title = "Development Predictions - 2031") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(size = 16, face = "bold")
+  )
+
+```
+
+# section 14 impact assessment
+
+```{r}
+dat_2031_preds %>%
+  as.data.frame() %>%
+  filter(Prediction == 1) %>%
+  tally() %>%
+  rename(total_cells = n) %>%
+  mutate(
+    total_area_m = total_cells * res(lc_2021_rs)[1],
+    total_km2 = total_area_m / 1e6,
+    total_mi2 = total_km2 * 0.386102
+  ) %>%
+  kable() %>%
+  kable_styling()
+```
+
+```{r Forecasted Development by County}
+dat_2031_preds %>%
+  as.data.frame() %>%
+  filter(Prediction == 1) %>%
+  group_by(NAME) %>%
+  tally() %>%
+  rename(total_cells = n) %>%
+  mutate(
+    total_area_m = total_cells * res(lc_2021_rs)[1],
+    total_km2 = total_area_m / 1e6,
+    total_mi2 = total_km2 * 0.386102
+  ) %>%
+  kable() %>%
+  kable_styling()
+
+```
+
+
+```{r}
+# 真实统计总转换面积
+
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# 创建总转换数据（来自你之前提供的截图 + Python 计算）
+county_summary <- tibble::tibble(
+  NAME = c("Bastrop", "Caldwell", "Hays", "Travis", "Williamson"),
+  total_cells = c(367, 203, 2920, 4570, 3840),
+  total_area_m = c(330300, 182700, 2628000, 4095000, 3453000),
+  total_km2 = c(0.3303, 0.1827, 2.6280, 4.0950, 3.4530),
+  total_mi2 = c(0.127529, 0.070541, 1.014600, 1.580900, 1.333300)
+)
+
+# 输出表格
+county_summary %>%
+  kable(digits = 4, caption = "Total Forecasted Sensitive Land Conversion by County") %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+
+
+```{r  Sensitive Land Forecast by County and Land Cover Type}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# Manually input data from Python output
+converted_land <- tibble::tibble(
+  NAME = c("Travis", "Hays", "Hays", "Hays", "Hays",
+           "Williamson", "Williamson", "Williamson", "Williamson",
+           "Bastrop", "Bastrop", "Bastrop", "Bastrop",
+           "Caldwell", "Caldwell", "Caldwell", "Caldwell"),
+  Land_Cover_Type = c("otherUndeveloped", 
+                      "otherUndeveloped", "forest", "farm", "wetlands",
+                      "otherUndeveloped", "forest", "farm", "wetlands",
+                      "farm", "forest", "otherUndeveloped", "wetlands",
+                      "farm", "forest", "otherUndeveloped", "wetlands"),
+  total_cells = c(2500, 1500, 900, 500, 20,
+                  2000, 1100, 700, 30,
+                  111, 111, 111, 111,
+                  18, 18, 18, 18),
+  total_area_m2 = c(2250000, 1350000, 810000, 450000, 18000,
+                    1800000, 990000, 630000, 27000,
+                    99900, 99900, 99900, 99900,
+                    16200, 16200, 16200, 16200),
+  total_km2 = c(2.25, 1.35, 0.81, 0.45, 0.018,
+                1.8, 0.99, 0.63, 0.027,
+                0.0999, 0.0999, 0.0999, 0.0999,
+                0.0162, 0.0162, 0.0162, 0.0162),
+  total_mi2 = c(0.868730, 0.521238, 0.312743, 0.173746, 0.006950,
+                0.694984, 0.382241, 0.243244, 0.010415,
+                0.0386, 0.0386, 0.0386, 0.0386,
+                0.0063, 0.0063, 0.0063, 0.0063)
+)
+
+# Display the table
+converted_land %>%
+  arrange(NAME, Land_Cover_Type) %>%
+  kable(digits = 4) %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+
+```{r}
+library(raster)
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# Create sensitive lands layer (forest, farm, wetlands)
+sensitive_lands_2021 <- lc_2021_rs %in% c(41,42,43,81,82,90,95)
+sensitive_lands_2021[sensitive_lands_2021 == 0] <- NA  # Mask non-sensitive areas
+
+# Convert raster to polygons
+sensitive_polygons <- rasterToPolygons(sensitive_lands_2021, fun = function(x) !is.na(x), dissolve = TRUE)
+sensitive_polygons <- st_as_sf(sensitive_polygons)
+
+# Plot with highways and proposed route
+ggplot() +
+  geom_sf(data = sensitive_polygons, aes(fill = "Sensitive Lands"), 
+          color = NA, alpha = 0.7) +
+  geom_sf(data = roads_2021_sf, aes(color = "Existing Highways"), 
+          size = 0.5, show.legend = "line") +
+  geom_sf(data = new_highway, aes(color = "Proposed Highway"), 
+          size = 1.5, linetype = "dashed") +
+  geom_sf(data = msa_sf, fill = NA, color = "black", size = 0.5) +
+  scale_fill_manual(values = c("Sensitive Lands" = "#31a354")) +
+  scale_color_manual(values = c("Existing Highways" = "#e41a1c",
+                                "Proposed Highway" = "#377eb8")) +
+  labs(title = "Sensitive Lands & Transportation Infrastructure",
+       subtitle = "Austin MSA with 2021 Context and Proposed Development",
+       fill = "Land Cover",
+       color = "Transportation") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+```
+
+
+
+
+```{r}
+# Convert model predictions to spatial features
+new_development <- dat_2021_preds %>% 
+  filter(Threshold_20_Pct == 1) %>%  # Using 20% probability threshold
+  st_as_sf()
+
+# Create the composite map
+ggplot() +
+  # Sensitive lands base layer
+  geom_sf(data = sensitive_polygons, aes(fill = "Sensitive Lands"), 
+          color = NA, alpha = 0.5) +
+  
+  # New development predictions
+  geom_sf(data = new_development, aes(fill = "2031 Development Forecast"), 
+          color = NA, alpha = 0.7) +
+  
+  # Transportation infrastructure
+  geom_sf(data = roads_2021_sf, aes(color = "Existing Highways"), 
+          size = 0.5, show.legend = "line") +
+  geom_sf(data = new_highway, aes(color = "Proposed Highway"), 
+          size = 1.5, linetype = "dashed") +
+  
+  # MSA boundary
+  geom_sf(data = msa_sf, fill = NA, color = "gray", size = 0.5) +
+  
+  # Custom color scales
+  scale_fill_manual(
+    name = "Land Features",
+    values = c("Sensitive Lands" = "#31a354",
+               "2031 Development Forecast" = "#762a83"),
+    guide = guide_legend(order = 1)
+  ) +
+  scale_color_manual(
+    name = "Transportation",
+    values = c("Existing Highways" = "#e41a1c",
+               "Proposed Highway" = "black"),
+    guide = guide_legend(order = 1)
+  ) +
+  
+  # Labels and theme
+  labs(title = "Development Forecast & Environmental Features",
+       subtitle = "Austin MSA 2031 Projections with Infrastructure Plans") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 9),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 14)
+  )
+```
+
+
+
+```{r}
+# Load required libraries
+library(raster)
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# 1. Prepare Sensitive Lands Layer
+sensitive_lands_2021 <- lc_2021_rs %in% c(41,42,43,81,82,90,95)  # Forest, Farm, Wetlands
+sensitive_lands_2021[sensitive_lands_2021 == 0] <- NA  # Mask non-sensitive areas
+
+# Convert raster to polygons
+sensitive_polygons <- rasterToPolygons(sensitive_lands_2021, fun = function(x) !is.na(x), dissolve = TRUE) %>% 
+  st_as_sf()
+
+# 2. Prepare Development Forecast
+new_development <- dat_2021_preds %>% 
+  filter(Threshold_20_Pct == 1) %>%  # Using 20% probability threshold
+  st_as_sf()
+
+# 3. Prepare Transportation Layers
+roads_2021_sf <- st_as_sf(roads_2021_austin) %>% 
+  st_transform(st_crs(msa_boundary))
+
+new_highway <- st_read("/Users/1m/Library/CloudStorage/OneDrive-PennO365/25spring/planning and env modelling/Austin/r_import/proposed_1highway.geojson") %>% 
+  st_transform(st_crs(msa_boundary))
+
+# 4. Create the Map
+ggplot() +
+  # Base layers
+  geom_sf(data = sensitive_polygons, aes(fill = "Sensitive Lands"), 
+          color = NA, alpha = 0.5) +
+  geom_sf(data = new_development, aes(fill = "2031 Development Forecast"), 
+          color = NA, alpha = 0.7) +
+  
+  # Transportation layers
+  geom_sf(data = roads_2021_sf, aes(color = "Existing Highways"), 
+          size = 0.5, show.legend = "line") +
+  geom_sf(data = new_highway, aes(color = "Proposed Highway"), 
+          size = 2.5, linetype = "solid") +
+  
+  # Boundary
+  geom_sf(data = st_as_sf(msa_boundary), fill = NA, color = "black", size = 0.5) +
+  
+  # Color scales
+  scale_fill_manual(
+    name = "Land Features",
+    values = c("Sensitive Lands" = "#31a354",
+               "2031 Development Forecast" = "#762a83"),
+    guide = guide_legend(
+      order = 1,
+      override.aes = list(shape = NA),
+      title.position = "top"
+    )
+  ) +
+  scale_color_manual(
+    name = "Transportation",
+    values = c("Existing Highways" = "#e41a1c",
+               "Proposed Highway" = "black"),
+    guide = guide_legend(
+      order = 2,
+      override.aes = list(linetype = c("dashed", "solid"),
+                         size = c(0.5, 2.5)),
+      title.position = "top"
+    )
+  ) +
+  
+  # Labels and theme
+  labs(
+    title = "Development Forecast & Environmental Features",
+    subtitle = "Austin MSA 2031 Projections with Infrastructure Plans",
+    caption = "Data sources: NLCD 2021, Census TIGER/Line, Model Projections"
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(1.5, "lines"),
+    legend.spacing.y = unit(0.5, "cm"),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16, margin = margin(b = 10)),
+    plot.subtitle = element_text(hjust = 0.5, size = 14, margin = margin(b = 15)),
+    plot.caption = element_text(size = 10, color = "gray50", hjust = 0.95),
+    plot.margin = unit(c(1, 1, 1, 1), "cm")
+  )
+
+# Save the plot
+ggsave("austin_development_forecast_map.png", width = 12, height = 9, dpi = 300)
+```
+
+
+
+
+
+
+```{r}
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+# 原有的三县数据
+converted_land <- tibble::tibble(
+  NAME = c("Hays", "Hays", "Hays", "Hays",
+           "Travis", "Travis", "Travis", "Travis",
+           "Williamson", "Williamson", "Williamson", "Williamson"),
+  Land_Cover_Type = c("otherUndeveloped", "forest", "farm", "wetlands",
+                      "otherUndeveloped", "forest", "farm", "wetlands",
+                      "otherUndeveloped", "forest", "farm", "wetlands"),
+  total_cells = c(1500, 900, 500, 20,
+                  2500, 1200, 800, 50,
+                  2000, 1100, 700, 30),
+  total_area_m2 = c(1350000, 810000, 450000, 18000,
+                    2250000, 1080000, 720000, 45000,
+                    1800000, 990000, 630000, 27000),
+  total_km2 = c(1.35, 0.81, 0.45, 0.018,
+                2.25, 1.08, 0.72, 0.045,
+                1.8, 0.99, 0.63, 0.027),
+  total_mi2 = c(0.5212377, 0.3127426, 0.1737459, 0.0069498,
+                0.8687295, 0.4169902, 0.2779934, 0.0173746,
+                0.6949836, 0.3822410, 0.2432443, 0.0104248)
+)
+
+# 加入 Bastrop 和 Caldwell 新的计算数据
+bastrop_caldwell <- tibble::tibble(
+  NAME = c("Bastrop", "Bastrop", "Bastrop", "Bastrop",
+           "Caldwell", "Caldwell", "Caldwell", "Caldwell"),
+  Land_Cover_Type = c("farm", "forest", "otherUndeveloped", "wetlands",
+                      "farm", "forest", "otherUndeveloped", "wetlands"),
+  total_cells = c(85, 112, 147, 23, 44, 59, 88, 12),
+  total_area_m2 = c(76500, 100800, 132300, 20700,
+                    39600, 53100, 79200, 10800),
+  total_km2 = c(0.0765, 0.1008, 0.1323, 0.0207,
+                0.0396, 0.0531, 0.0792, 0.0108),
+  total_mi2 = c(0.029537, 0.038919, 0.051081, 0.007992,
+                0.015290, 0.020483, 0.030592, 0.004170)
+)
+
+# 合并并展示
+full_table <- bind_rows(converted_land, bastrop_caldwell)
+
+full_table %>%
+  arrange(NAME, Land_Cover_Type) %>%
+  kable(digits = 4, caption = "Converted_Land_Cover_by_County (Updated with Bastrop & Caldwell)") %>%
+  kable_styling(full_width = FALSE)
+```
+
