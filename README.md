@@ -5,7 +5,7 @@ This repository contains a collection of coding samples developed as part of my 
 ## Contents
 
 ### [`coding_samples/`](coding_samples/)
-A curated folder of scripts, reports, and datasets. Highlights include:
+Folders of scripts, reports, and datasets. Highlights include:
 
 #### AMR Modeling in Python
 - **File:** [`amr_model.py`](coding_samples/amr_model.py)
