@@ -1,4 +1,4 @@
-# Uni — Coding Samples by Yimi Shao
+# Coding Samples by Yimi Shao
 
 This repository contains a collection of coding samples developed as part of my undergraduate and graduate coursework at the **University of Nottingham** and the **University of Pennsylvania**. It shows projects that integrate environmental analysis, spatial modeling, and statistical forecasting using both **Python** and **R**.
 
@@ -41,7 +41,7 @@ This repository serves as a portfolio to:
 ## About the Author
 
 **Yimi Shao**  
-Graduate Student, University of Pennsylvania, Environmental Studies — Concentration in Adaptation & Resilience  
+Graduate Student, University of Pennsylvania, Environmental Studies — Concentration in Sustainability, Adaptation & Resilience  
 📬 [LinkedIn](https://www.linkedin.com/in/yimi-shao)
 
 ---
